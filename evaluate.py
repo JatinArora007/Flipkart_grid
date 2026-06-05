@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBRegressor
+from autogluon.tabular import TabularPredictor
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split, KFold
 
 def process_features(df):
     df['hour'] = df['timestamp'].apply(lambda x: int(x.split(':')[0]))
@@ -17,81 +16,47 @@ def process_features(df):
     # Day features
     df['day_of_week'] = df['day'] % 7
     
-    # Geohash features
+    # Geohash features (helps Tree models generalize spatial regions)
     df['geohash_1'] = df['geohash'].str[:1]
     df['geohash_2'] = df['geohash'].str[:2]
     df['geohash_3'] = df['geohash'].str[:3]
     df['geohash_4'] = df['geohash'].str[:4]
     df['geohash_5'] = df['geohash'].str[:5]
     
+    # Drop useless columns for AutoGluon
+    if 'Index' in df.columns:
+        df = df.drop(columns=['Index'])
+    if 'timestamp' in df.columns:
+        df = df.drop(columns=['timestamp'])
+        
     return df
 
-print("Loading data...")
-train_df = pd.read_csv('train.csv')
+if __name__ == '__main__':
+    print("Loading data...")
+    train_df = pd.read_csv('train.csv')
 
-print("Processing features...")
-train_df = process_features(train_df)
+    print("Processing features...")
+    train_df = process_features(train_df)
 
-y = train_df['demand']
-features = [c for c in train_df.columns if c not in ['Index', 'demand', 'timestamp']]
+    # Train/val split
+    train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
 
-# Train/val split
-train_idx, val_idx = train_test_split(np.arange(len(train_df)), test_size=0.2, random_state=42)
+    print("Training AutoGluon model (this may take a while)...")
+    # Using 'best_quality' to get the absolute best score via bagging/stacking
+    predictor = TabularPredictor(label='demand', eval_metric='r2', problem_type='regression').fit(
+        train_data,
+        presets='best_quality',
+        time_limit=1200  # Limiting to 20 minutes max for evaluation
+    )
 
-df_train_part = train_df.iloc[train_idx].copy()
-df_val_part = train_df.iloc[val_idx].copy()
+    print("Predicting...")
+    preds = predictor.predict(val_data)
+    preds = np.clip(preds, 0, None)
 
-print("Applying Target Encoding...")
-te_cols = ['geohash', 'RoadType', 'Weather', 'Landmarks', 'LargeVehicles']
+    r2 = r2_score(val_data['demand'], preds)
+    score = max(0, 100 * r2)
 
-# Apply KFold Target Encoding on the train_part to avoid leakage
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
-
-for col in te_cols:
-    df_train_part[col + '_te'] = np.nan
-    global_mean = df_train_part['demand'].mean()
-    
-    # Calculate for val data using ALL train_part data
-    means = df_train_part.groupby(col)['demand'].mean()
-    df_val_part[col + '_te'] = df_val_part[col].map(means).fillna(global_mean)
-    
-    # Calculate for train_part data using out-of-fold
-    for tr_k_idx, val_k_idx in kf.split(df_train_part):
-        X_tr = df_train_part.iloc[tr_k_idx]
-        fold_means = X_tr.groupby(col)['demand'].mean()
-        df_train_part.iloc[val_k_idx, df_train_part.columns.get_loc(col + '_te')] = df_train_part.iloc[val_k_idx][col].map(fold_means).fillna(global_mean)
-
-df_all = pd.concat([df_train_part, df_val_part], axis=0)
-
-cat_cols = ['geohash', 'RoadType', 'LargeVehicles', 'Landmarks', 'Weather', 
-            'geohash_1', 'geohash_2', 'geohash_3', 'geohash_4', 'geohash_5']
-
-for col in cat_cols:
-    df_all[col] = df_all[col].fillna('Unknown')
-    le = LabelEncoder()
-    df_all[col] = le.fit_transform(df_all[col].astype(str))
-
-num_cols = ['day', 'NumberofLanes', 'Temperature', 'hour', 'minute', 'time_in_mins', 'sin_time', 'cos_time', 'day_of_week']
-for col in num_cols:
-    df_all[col] = pd.to_numeric(df_all[col], errors='coerce')
-
-# Re-split based on lengths
-X_train = df_all.iloc[:len(df_train_part)][[c for c in df_all.columns if c not in ['Index', 'demand', 'timestamp']]]
-y_train = df_all.iloc[:len(df_train_part)]['demand']
-
-X_val = df_all.iloc[len(df_train_part):][[c for c in df_all.columns if c not in ['Index', 'demand', 'timestamp']]]
-y_val = df_all.iloc[len(df_train_part):]['demand']
-
-print("Training model...")
-model = XGBRegressor(n_estimators=700, learning_rate=0.03, max_depth=8, random_state=42, n_jobs=-1, subsample=0.8, colsample_bytree=0.8)
-model.fit(X_train, y_train)
-
-print("Predicting...")
-preds = model.predict(X_val)
-preds = np.clip(preds, 0, None)
-
-r2 = r2_score(y_val, preds)
-score = max(0, 100 * r2)
-
-print(f"Validation R2 Score: {r2}")
-print(f"Competition Score: {score}")
+    print(f"Validation R2 Score: {r2}")
+    print(f"Competition Score: {score}")
+    print("\nAutoGluon Leaderboard:")
+    print(predictor.leaderboard(val_data))
